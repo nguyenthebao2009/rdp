@@ -1,0 +1,74 @@
+name: WINDOWS 2022 RDP
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360   # ~6h (giới hạn GitHub-hosted)
+
+    steps:
+      - name: Download ngrok
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath ngrok
+
+      - name: Connect Ngrok (set authtoken)
+        shell: pwsh
+        env:
+          NGROK_AUTH: ${{ secrets.NGROK_AUTH }}
+        run: |
+          .\ngrok\ngrok.exe config add-authtoken $Env:NGROK_AUTH
+          Write-Host "Ngrok authtoken set."
+
+      - name: Enable RDP & Firewall
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Write-Host "RDP enabled."
+
+      - name: Set password for runneradmin
+        shell: pwsh
+        # Cách A (an toàn): dùng secret
+        env:
+          RDP_PASS: ${{ secrets.RDP_PASS }}   # tạo secret này, ví dụ Bao2009@
+        run: |
+          $user = "runneradmin"
+          $pass = if ($Env:RDP_PASS) { $Env:RDP_PASS } else { "Bao2009@" }  # fallback nếu chưa tạo secret
+          net user $user "$pass"
+          net localgroup "Remote Desktop Users" $user /add | Out-Null
+          Write-Host "Password set for $user."
+
+      - name: Start ngrok TCP 3389 (hidden)
+        shell: pwsh
+        run: |
+          # Chạy ngrok ẩn hoàn toàn
+          $p = Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --region ap" -WindowStyle Hidden -PassThru
+          Write-Host "ngrok PID: $($p.Id)"
+          # chờ ngrok API sẵn sàng rồi lấy địa chỉ
+          Start-Sleep -Seconds 6
+          $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction SilentlyContinue
+          if (-not $resp) { Start-Sleep -Seconds 4; $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" }
+          $tcp  = $resp.tunnels | Where-Object { $_.proto -eq "tcp" }
+          $addr = $tcp.public_url.Replace("tcp://","")
+          Write-Host "==============================="
+          Write-Host ("RDP Address : {0}" -f $addr)
+          Write-Host ("Username    : runneradmin")
+          Write-Host ("Password    : (giá trị bạn đặt ở step trước)")
+          Write-Host "==============================="
+
+      - name: Keep alive (~6h) hidden
+        shell: pwsh
+        run: |
+          # Tạo file keepalive và chạy ẩn, sau đó chờ process đó kết thúc
+          $script = "$env:TEMP\keepalive.ps1"
+          @'
+          for ($i=0; $i -lt 360; $i++) { Start-Sleep -Seconds 60 }
+          '@ | Out-File -Encoding ASCII $script
+
+          $kp = Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$script`"" -WindowStyle Hidden -PassThru
+          Write-Host "Keepalive PID: $($kp.Id)"
+          Wait-Process -Id $kp.Id
